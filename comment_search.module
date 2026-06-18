@@ -9,18 +9,6 @@
  */
 
 /**
- * Implements hook_autoload_info().
- *
- * Registers SearchQuery so that db_select()->extend('SearchQuery') can
- * resolve the class via Backdrop's class registry.
- */
-function comment_search_autoload_info() {
-  return array(
-    'SearchQuery' => backdrop_get_path('module', 'search') . '/search.extender.inc',
-  );
-}
-
-/**
  * Implements hook_config_info().
  */
 function comment_search_config_info() {
