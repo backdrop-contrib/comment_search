@@ -1,0 +1,11 @@
+name = Comment Search
+description = Provides a dedicated search tab for comments with results linking directly to the matched comment anchor.
+type = module
+package = Comments
+group = Search
+tags[] = Search
+backdrop = 1.x
+dependencies[] = comment
+dependencies[] = search
+
+configure = admin/config/search/settings

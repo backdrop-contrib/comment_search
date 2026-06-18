@@ -1,0 +1,492 @@
+<?php
+/**
+ * @file
+ * Provides a dedicated search tab for comments.
+ *
+ * Each comment is indexed individually so that search results link directly
+ * to the matched comment anchor via the comment permalink (comment/[cid])
+ * rather than to the top of the parent node.
+ */
+
+/**
+ * Implements hook_autoload_info().
+ *
+ * Registers SearchQuery so that db_select()->extend('SearchQuery') can
+ * resolve the class via Backdrop's class registry.
+ */
+function comment_search_autoload_info() {
+  return array(
+    'SearchQuery' => backdrop_get_path('module', 'search') . '/search.extender.inc',
+  );
+}
+
+/**
+ * Implements hook_config_info().
+ */
+function comment_search_config_info() {
+  return array(
+    'comment_search.settings' => array(
+      'label' => t('Comment Search settings'),
+      'group' => t('Search'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for search_admin_settings.
+ *
+ * Adds an "Exclude comments from Content search tab results" checkbox to
+ * the existing "Search items" fieldset on the Search settings page.
+ */
+function comment_search_form_search_admin_settings_alter(&$form, &$form_state) {
+  $config = config('comment_search.settings');
+
+  $form['active']['comment_search_exclude_from_node'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Exclude comments from Content search tab results'),
+    '#description' => t('When checked, comment text will not be indexed as part of Content search results. Comments remain fully searchable via the Comments tab.'),
+    '#default_value' => $config->get('exclude_from_node') ? 1 : 0,
+  );
+
+  // Our submit handler must run before core's to unset our value from
+  // $form_state['values'] so it is not saved into search.settings by core.
+  array_unshift($form['#submit'], 'comment_search_form_search_admin_settings_submit');
+}
+
+/**
+ * Additional submit handler for search_admin_settings.
+ *
+ * Saves the exclude_from_node setting to comment_search.settings and
+ * removes the value from $form_state so core does not also save it into
+ * search.settings. Triggers a node re-index if the setting changed.
+ */
+function comment_search_form_search_admin_settings_submit($form, &$form_state) {
+  $config = config('comment_search.settings');
+  $previous = (bool) $config->get('exclude_from_node');
+  $new = (bool) $form_state['values']['comment_search_exclude_from_node'];
+
+  $config->set('exclude_from_node', $new);
+  $config->save();
+
+  // Remove our value so core's submit handler does not write it to
+  // search.settings.
+  unset($form_state['values']['comment_search_exclude_from_node']);
+
+  if ($previous !== $new) {
+    db_update('search_dataset')
+      ->fields(array('reindex' => REQUEST_TIME))
+      ->condition('type', 'node')
+      ->execute();
+    backdrop_set_message(t('Content search index will be rebuilt on the next cron run to reflect the comment exclusion change.'));
+  }
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ *
+ * When "Exclude comments from Content search tab results" is enabled,
+ * removes comment_node_update_index() from the node indexing pipeline so
+ * that comment text is not added to the node search index.
+ */
+function comment_search_module_implements_alter(&$implementations, $hook) {
+  if ($hook === 'node_update_index') {
+    $exclude = config_get('comment_search.settings', 'exclude_from_node');
+    if ($exclude) {
+      unset($implementations['comment']);
+    }
+  }
+}
+
+/**
+ * Implements hook_search_info().
+ */
+function comment_search_search_info() {
+  return array(
+    'title' => 'Comments',
+    'path' => 'comment',
+    'weight' => 0,
+  );
+}
+
+/**
+ * Implements hook_search_access().
+ */
+function comment_search_search_access() {
+  return user_access('access comments') && user_access('search content');
+}
+
+/**
+ * Conditions callback for hook_search_info().
+ * Implements hook_form_FORM_ID_alter() for search_form.
+ *
+ * Injects an advanced search fieldset into the search form when the user is
+ * on the Comments search tab and has the 'use advanced search' permission.
+ * Keyword refinements are submitted as GET parameters and folded into the
+ * search keys string in hook_search_execute().
+ */
+function comment_search_form_search_form_alter(&$form, &$form_state) {
+  // Only alter the form on the comment search tab.
+  if (arg(1) !== 'comment') {
+    return;
+  }
+
+  if (!user_access('use advanced search')) {
+    return;
+  }
+
+  $form['advanced'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Advanced search'),
+    '#collapsible' => TRUE,
+    '#collapsed' => empty($_GET['or']) && empty($_GET['phrase']) && empty($_GET['negative']),
+    '#attributes' => array('class' => array('search-advanced')),
+    '#weight' => 1,
+  );
+
+  $form['advanced']['keywords'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Keywords'),
+    '#collapsible' => FALSE,
+  );
+  $form['advanced']['keywords']['or'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Containing any of the words'),
+    '#size' => 30,
+    '#maxlength' => 255,
+    '#default_value' => isset($_GET['or']) ? check_plain($_GET['or']) : '',
+  );
+  $form['advanced']['keywords']['phrase'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Containing the phrase'),
+    '#size' => 30,
+    '#maxlength' => 255,
+    '#default_value' => isset($_GET['phrase']) ? check_plain($_GET['phrase']) : '',
+  );
+  $form['advanced']['keywords']['negative'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Containing none of the words'),
+    '#size' => 30,
+    '#maxlength' => 255,
+    '#default_value' => isset($_GET['negative']) ? check_plain($_GET['negative']) : '',
+  );
+
+  $form['advanced']['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Advanced search'),
+    '#prefix' => '<div class="action">',
+    '#suffix' => '</div>',
+  );
+
+  // Add a submit handler to fold advanced keywords into the GET redirect.
+  $form['#submit'][] = 'comment_search_form_search_form_submit';
+}
+
+/**
+ * Submit handler for the comment search advanced form.
+ *
+ * Appends advanced keyword GET parameters to the search redirect URL so
+ * they are available to hook_search_execute() on the results page.
+ */
+function comment_search_form_search_form_submit($form, &$form_state) {
+  $redirect = 'search/comment/' . trim($form_state['values']['keys']);
+  $options = array('query' => array());
+
+  foreach (array('or', 'phrase', 'negative') as $key) {
+    if (!empty($form_state['values'][$key])) {
+      $options['query'][$key] = $form_state['values'][$key];
+    }
+  }
+
+  $form_state['redirect'] = array($redirect, $options);
+}
+
+/**
+ * Implements hook_search_reset().
+ */
+function comment_search_search_reset() {
+  db_update('search_dataset')
+    ->fields(array('reindex' => REQUEST_TIME))
+    ->condition('type', 'comment_search')
+    ->execute();
+}
+
+/**
+ * Implements hook_search_status().
+ *
+ * @return array
+ *   An associative array with keys 'remaining' and 'total' indicating
+ *   indexing progress for the comment search index.
+ */
+function comment_search_search_status() {
+  $total = db_query(
+    'SELECT COUNT(*) FROM {comment} WHERE status = :status',
+    array(':status' => COMMENT_PUBLISHED)
+  )->fetchField();
+
+  $remaining = db_query(
+    "SELECT COUNT(*) FROM {comment} c
+     LEFT JOIN {search_dataset} d
+       ON d.type = 'comment_search' AND d.sid = c.cid
+     WHERE c.status = :status
+       AND (d.sid IS NULL OR d.reindex <> 0)",
+    array(':status' => COMMENT_PUBLISHED)
+  )->fetchField();
+
+  return array('remaining' => $remaining, 'total' => $total);
+}
+
+/**
+ * Implements hook_update_index().
+ *
+ * Indexes published comments in batches up to search_cron_limit. Each
+ * comment is stored as its own entry in {search_index} using the comment's
+ * cid as the sid, allowing per-comment search results and direct anchor links.
+ */
+function comment_search_update_index() {
+  // Determine whether comments should be indexed at all, based on permissions.
+  // Any role that can search content must also be able to access comments,
+  // otherwise indexing is skipped entirely.
+  $index_comments = TRUE;
+  $perms = array('access comments' => array(), 'search content' => array());
+  $roles = user_roles(FALSE, NULL, TRUE);
+  foreach ($roles as $role_name => $role) {
+    if (in_array('access comments', $role->permissions)) {
+      $perms['access comments'][$role_name] = $role_name;
+    }
+    if (in_array('search content', $role->permissions)) {
+      $perms['search content'][$role_name] = $role_name;
+    }
+  }
+  foreach ($perms['search content'] as $role_name) {
+    if (!isset($perms['access comments'][$role_name]) &&
+        ($role_name === BACKDROP_ANONYMOUS_ROLE ||
+         $role_name === BACKDROP_AUTHENTICATED_ROLE ||
+         !isset($perms['access comments'][BACKDROP_AUTHENTICATED_ROLE]))) {
+      $index_comments = FALSE;
+      break;
+    }
+  }
+  if (!$index_comments) {
+    return;
+  }
+
+  $limit = (int) config_get('search.settings', 'search_cron_limit');
+  $result = db_query_range(
+    "SELECT c.cid FROM {comment} c
+     LEFT JOIN {search_dataset} d
+       ON d.type = 'comment_search' AND d.sid = c.cid
+     WHERE c.status = :status
+       AND (d.sid IS NULL OR d.reindex <> 0)
+     ORDER BY d.reindex ASC, c.cid ASC",
+    0,
+    $limit,
+    array(':status' => COMMENT_PUBLISHED)
+  );
+
+  foreach ($result as $row) {
+    $comment = comment_load($row->cid);
+    if (!$comment) {
+      continue;
+    }
+    $node = node_load($comment->nid);
+    if (!$node || !$node->status) {
+      continue;
+    }
+
+    $text = '<h2>' . check_plain($comment->subject) . '</h2>';
+    $body_items = field_get_items('comment', $comment, 'comment_body');
+    if ($body_items) {
+      foreach ($body_items as $item) {
+        $format = isset($item['format']) ? $item['format'] : filter_default_format();
+        $value = isset($item['value']) ? $item['value'] : '';
+        $text .= ' ' . check_markup($value, $format, '', TRUE);
+      }
+    }
+
+    // Allow other modules to add content to the comment's index entry.
+    $extra = module_invoke_all('comment_search_index', $comment, $node);
+    $text .= ' ' . implode(' ', $extra);
+
+    search_index($comment->cid, 'comment_search', $text);
+  }
+}
+
+/**
+ * Implements hook_search_execute().
+ *
+ * Fetches all matching comments in one pass, deduplicates by cid, then
+ * paginates manually using pager_default_initialize(). This approach is
+ * used because SearchQuery's internal query rewriting makes a separate
+ * count query unreliable.
+ *
+ * Advanced search keyword refinements (phrase, OR, negative) are folded
+ * into the keys string in the same format core node search uses, so
+ * SearchQuery's built-in parsing handles them automatically.
+ *
+ * @param string|null $keys
+ *   The search keywords entered by the user.
+ * @param array|null $conditions
+ *   Additional conditions from the advanced search form, if any.
+ *
+ * @return array
+ *   An array of search result arrays, each with keys: link, type, title,
+ *   date, extra, snippet, and optionally user.
+ */
+function comment_search_search_execute($keys = NULL, $conditions = NULL) {
+  // Fold advanced search keyword refinements into the keys string,
+  // matching the format core node search uses so SearchQuery parses them.
+  if (user_access('use advanced search')) {
+    if (!empty($_GET['phrase'])) {
+      $keys .= ' "' . str_replace('"', ' ', $_GET['phrase']) . '"';
+    }
+    if (!empty($_GET['or'])) {
+      $or_terms = array_filter(explode(' ', $_GET['or']));
+      if ($or_terms) {
+        $keys .= ' ' . implode(' OR ', $or_terms);
+      }
+    }
+    if (!empty($_GET['negative'])) {
+      foreach (array_filter(explode(' ', $_GET['negative'])) as $term) {
+        $keys .= ' -' . $term;
+      }
+    }
+  }
+
+  $base = db_select('search_index', 'i', array('target' => 'replica'));
+  $query = $base->extend('SearchQuery');
+
+  $query->join('comment', 'c', 'c.cid = i.sid AND c.status = :status',
+    array(':status' => COMMENT_PUBLISHED));
+  $query->join('node', 'n', 'n.nid = c.nid AND n.status = 1');
+  $query->join('users', 'u', 'u.uid = c.uid');
+
+  $query
+    ->condition('i.type', 'comment_search')
+    ->searchExpression($keys, 'comment_search')
+    ->fields('c', array('cid', 'nid', 'subject', 'uid', 'changed'));
+  $query->addField('u', 'name');
+
+  $find = $query->execute();
+  $all_rows = $find ? $find->fetchAll() : array();
+
+  if (empty($all_rows)) {
+    return array();
+  }
+
+  // Remove duplicates by cid since search_index has 1 row per word per comment.
+  $seen = array();
+  $unique_rows = array();
+  foreach ($all_rows as $row) {
+    if (!isset($seen[$row->cid])) {
+      $seen[$row->cid] = TRUE;
+      $unique_rows[] = $row;
+    }
+  }
+
+  $total_count = count($unique_rows);
+
+  // Core search does not expose a results-per-page config key; use 10
+  // to match core's hardcoded default in search_view().
+  $per_page = 10;
+
+  // Initialise the pager — core renders it automatically.
+  $current_page = pager_default_initialize($total_count, $per_page);
+  $offset = $current_page * $per_page;
+  $page_rows = array_slice($unique_rows, $offset, $per_page);
+
+  $results = array();
+  foreach ($page_rows as $item) {
+    $comment = comment_load($item->cid);
+    $node = node_load($item->nid);
+    if (!$comment || !$node) {
+      continue;
+    }
+
+    if (!node_access('view', $node) || !comment_access('view', $comment)) {
+      continue;
+    }
+
+    $text = '<h2>' . check_plain($comment->subject) . '</h2>';
+    $body_items = field_get_items('comment', $comment, 'comment_body');
+    if ($body_items) {
+      foreach ($body_items as $body_item) {
+        $format = isset($body_item['format']) ? $body_item['format'] : filter_default_format();
+        $value = isset($body_item['value']) ? $body_item['value'] : '';
+        $text .= ' ' . check_markup($value, $format, '', TRUE);
+      }
+    }
+    $snippet = search_excerpt($keys, $text);
+
+    $link = url('comment/' . $item->cid, array(
+      'fragment' => 'comment-' . $item->cid,
+      'absolute' => FALSE,
+    ));
+
+    // Only show author for registered users. Anonymous commenter names are
+    // omitted to avoid showing unverified names or a "(not verified)" suffix.
+    $result = array(
+      'link'    => $link,
+      'type'    => t('Comment'),
+      'title'   => check_plain($comment->subject) ?: t('(no subject)'),
+      'date'    => $item->changed,
+      'extra'   => array(
+        l(check_plain($node->title), 'node/' . $node->nid),
+      ),
+      'snippet' => $snippet,
+    );
+    if ($item->uid > 0) {
+      $result['user'] = l($item->name, 'user/' . $item->uid);
+    }
+    $results[] = $result;
+  }
+
+  return $results;
+}
+
+/**
+ * Implements hook_comment_delete().
+ *
+ * Removes the deleted comment from the search index immediately.
+ *
+ * @param object $comment
+ *   The comment object being deleted.
+ */
+function comment_search_comment_delete($comment) {
+  search_reindex($comment->cid, 'comment_search');
+}
+
+/**
+ * Implements hook_comment_update().
+ *
+ * Marks an updated comment for re-indexing on the next cron run.
+ *
+ * @param object $comment
+ *   The comment object being updated.
+ */
+function comment_search_comment_update($comment) {
+  search_reindex($comment->cid, 'comment_search');
+}
+
+/**
+ * Implements hook_comment_publish().
+ *
+ * Marks a newly published comment for indexing on the next cron run.
+ *
+ * @param object $comment
+ *   The comment object being published.
+ */
+function comment_search_comment_publish($comment) {
+  search_reindex($comment->cid, 'comment_search');
+}
+
+/**
+ * Implements hook_comment_unpublish().
+ *
+ * Marks an unpublished comment for removal from the search index.
+ *
+ * @param object $comment
+ *   The comment object being unpublished.
+ */
+function comment_search_comment_unpublish($comment) {
+  search_reindex($comment->cid, 'comment_search');
+}
