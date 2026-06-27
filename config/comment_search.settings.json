@@ -1,4 +1,5 @@
 {
     "_config_name": "comment_search.settings",
+    "_config_static": true,
     "exclude_from_node": false
 }
