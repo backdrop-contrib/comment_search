@@ -285,8 +285,8 @@ function comment_search_update_index() {
     $body_items = field_get_items('comment', $comment, 'comment_body');
     if ($body_items) {
       foreach ($body_items as $item) {
-        $format = isset($item['format']) ? $item['format'] : filter_default_format();
-        $value = isset($item['value']) ? $item['value'] : '';
+        $format = $item['format'] ?? filter_default_format();
+        $value = $item['value'] ?? '';
         $text .= ' ' . check_markup($value, $format, '', TRUE);
       }
     }
@@ -398,8 +398,8 @@ function comment_search_search_execute($keys = NULL, $conditions = NULL) {
     $body_items = field_get_items('comment', $comment, 'comment_body');
     if ($body_items) {
       foreach ($body_items as $body_item) {
-        $format = isset($body_item['format']) ? $body_item['format'] : filter_default_format();
-        $value = isset($body_item['value']) ? $body_item['value'] : '';
+        $format = $body_item['format'] ?? filter_default_format();
+        $value = $body_item['value'] ?? '';
         $text .= ' ' . check_markup($value, $format, '', TRUE);
       }
     }
