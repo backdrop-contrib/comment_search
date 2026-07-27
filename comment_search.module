@@ -478,3 +478,74 @@ function comment_search_comment_publish($comment) {
 function comment_search_comment_unpublish($comment) {
   search_reindex($comment->cid, 'comment_search');
 }
+
+/**
+ * Implements hook_search_combined_result().
+ *
+ * Provides result rendering for the 'comment_search' type when the
+ * search_combined module is installed and requests comment results.
+ *
+ * @param string $type
+ *   The search index type.
+ * @param int $sid
+ *   The comment ID (cid).
+ * @param string $keys
+ *   The search keywords for building the snippet.
+ *
+ * @return array|null
+ *   A search result array suitable for theme_search_result(), or NULL if
+ *   not applicable or inaccessible.
+ */
+function comment_search_search_combined_result($type, $sid, $keys) {
+  if ($type !== 'comment_search') {
+    return NULL;
+  }
+
+  $comment = comment_load($sid);
+  if (!$comment) {
+    return NULL;
+  }
+  $node = node_load($comment->nid);
+  if (!$node || !$node->status) {
+    return NULL;
+  }
+  if (!node_access('view', $node) || !comment_access('view', $comment)) {
+    return NULL;
+  }
+
+  $text = '<h2>' . check_plain($comment->subject) . '</h2>';
+  $body_items = field_get_items('comment', $comment, 'comment_body');
+  if ($body_items) {
+    foreach ($body_items as $body_item) {
+      $format = $body_item['format'] ?? filter_default_format();
+      $value = $body_item['value'] ?? '';
+      $text .= ' ' . check_markup($value, $format, '', TRUE);
+    }
+  }
+  $snippet = search_excerpt($keys, $text);
+
+  $link = url('comment/' . $sid, array(
+    'fragment' => 'comment-' . $sid,
+    'absolute' => FALSE,
+  ));
+
+  $result = array(
+    'link'    => $link,
+    'type'    => t('Comment'),
+    'title'   => check_plain($comment->subject) ?: t('(no subject)'),
+    'date'    => $comment->changed,
+    'extra'   => array(
+      l(check_plain($node->title), 'node/' . $node->nid),
+    ),
+    'snippet' => $snippet,
+  );
+
+  if ($comment->uid > 0) {
+    $account = user_load($comment->uid);
+    if ($account) {
+      $result['user'] = l($account->name, 'user/' . $comment->uid);
+    }
+  }
+
+  return $result;
+}

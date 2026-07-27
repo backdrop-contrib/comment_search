@@ -8,6 +8,11 @@ directly to the matched comment via the Backdrop comment permalink
 (`/comment/[cid]`), which redirects to the correct page of the comment
 thread and lands on the right anchor.
 
+The module also implements `hook_search_combined_result()` to integrate with the
+[Search Combined](https://github.com/backdrop-contrib/search_combined) module so
+that comment search results also appear on the integrated **Combined** search
+tab that module provides when it is configured to include comments.
+
 ## How it differs from core content search
 
 Backdrop's core search indexes comment text as part of the parent node's
@@ -32,8 +37,9 @@ the comments providing context. This may be beneficial for Forums created with
 views and other applications.
 
 This module provides the option to preserve the original behavior for backward
-compatibility and for any use case where it is desired by unchecking **Exclude comments from Content search tab results**. When the module is first enabled the default
-is unchecked.
+compatibility and for any use case where it is desired by unchecking
+**Exclude comments from Content search tab results**. When the module is first
+enabled the default is unchecked.
 
 The main purpose of this module is to provide a search for all comments and this
 is done in a separate tab on the Search form. The module maintains a separate
