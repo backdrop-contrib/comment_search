@@ -109,6 +109,45 @@ The Comments tab displays 10 results per page, matching Backdrop core's
 hardcoded default for search results. Core does not expose a results-per-page
 configuration key in search settings.
 
+## Search relevance
+
+Comment search results are ranked by relevance score. The base score is
+calculated from two factors:
+
+**Word frequency** - a comment where the search term appears multiple times
+scores higher than a comment where the term appears only once.
+
+**Tag weights** - words are weighted by the HTML tag they appear in during
+indexing. The comment subject is indexed inside an `<h2>` tag, giving it a
+weight of 18 compared to a weight of 1 for plain body text. This means a
+search term appearing in a comment subject ranks that comment higher than one
+where the term only appears in the body.
+
+Two additional ranking factors are configurable under **Comment settings** on
+**Admin > Configuration > Search > Search settings**, each with an influence
+weight from 0 (ignored) to 10 (strong influence):
+
+- **Keyword relevance** - applies a multiplier to the base word frequency and
+  tag weight score. When set to 0 the base score still determines ordering;
+  increasing this weight amplifies the influence of keyword matching relative
+  to recency.
+- **Recently posted** - boosts comments posted more recently relative to the
+  oldest result in the current result set. When set to 0 recency has no
+  influence on ranking.
+
+The following factors do not affect comment search ranking:
+
+- **Link tracking** - `search_index()` automatically records links found in
+  comment bodies in `{search_node_links}`. However this data is used to boost
+  the ranking of the target node in Content search results, not the comment
+  containing the link. Comments that are targets of links from other content
+  do not receive a ranking boost in comment search.
+- **Parent node popularity** - a comment on a heavily-linked or
+  frequently-visited node does not inherit any relevance boost from its parent.
+- **Thread depth and reply count** - reply relationships between comments are
+  stored as database associations, not as links in indexed text, so they do
+  not contribute to relevance scoring.
+
 ## Keeping the index current
 
 The index is updated on each cron run. Individual comments are also flagged

@@ -9,6 +9,18 @@
  */
 
 /**
+ * Implements hook_theme().
+ */
+function comment_search_theme() {
+  return array(
+    'comment_search_admin' => array(
+      'render element' => 'form',
+      'file' => 'comment_search.theme.inc',
+    ),
+  );
+}
+
+/**
  * Implements hook_config_info().
  */
 function comment_search_config_info() {
@@ -24,11 +36,13 @@ function comment_search_config_info() {
  * Implements hook_form_FORM_ID_alter() for search_admin_settings.
  *
  * Adds an "Exclude comments from Content search tab results" checkbox to
- * the existing "Search items" fieldset on the Search settings page.
+ * the existing "Search items" fieldset, and a "Comment settings" fieldset
+ * with "Comment rankings" matching the style of core's Content rankings.
  */
 function comment_search_form_search_admin_settings_alter(&$form, &$form_state) {
   $config = config('comment_search.settings');
 
+  // Add exclude checkbox to the existing Search items fieldset.
   $form['active']['comment_search_exclude_from_node'] = array(
     '#type' => 'checkbox',
     '#title' => t('Exclude comments from Content search tab results'),
@@ -36,17 +50,59 @@ function comment_search_form_search_admin_settings_alter(&$form, &$form_state) {
     '#default_value' => $config->get('exclude_from_node') ? 1 : 0,
   );
 
-  // Our submit handler must run before core's to unset our value from
-  // $form_state['values'] so it is not saved into search.settings by core.
+  // Comment settings fieldset matching core's Content settings structure.
+  $options = backdrop_map_assoc(range(0, 10));
+
+  $comment_settings = array(
+    '#type' => 'fieldset',
+    '#title' => t('Comment settings'),
+  );
+
+  $comment_settings['comment_ranking'] = array(
+    '#type' => 'item',
+    '#title' => t('Comment rankings'),
+    '#theme' => 'comment_search_admin',
+    '#help' => t('Influence is a numeric multiplier used in ordering search results. A higher number means the corresponding factor has more influence on search results; zero means the factor is ignored. Changing these numbers does not require the search index to be rebuilt. Changes take effect immediately.'),
+  );
+
+  $comment_settings['comment_ranking']['factors']['comment_rank_relevance'] = array(
+    '#title' => t('Keyword relevance'),
+    '#type' => 'select',
+    '#options' => $options,
+    '#default_value' => $config->get('comment_rank_relevance') ?: 0,
+  );
+
+  $comment_settings['comment_ranking']['factors']['comment_rank_recency'] = array(
+    '#title' => t('Recently posted'),
+    '#type' => 'select',
+    '#options' => $options,
+    '#default_value' => $config->get('comment_rank_recency') ?: 0,
+  );
+
+  // Insert comment_settings immediately before the Indexing fieldset.
+  $offset = 0;
+  $keys = array_keys($form);
+  foreach ($keys as $i => $key) {
+    if ($key === 'indexing') {
+      $offset = $i;
+      break;
+    }
+  }
+
+  $form = array_slice($form, 0, $offset, TRUE)
+    + array('comment_settings' => $comment_settings)
+    + array_slice($form, $offset, NULL, TRUE);
+
+  // Our submit handler must run before core's to prevent values being saved
+  // into search.settings.
   array_unshift($form['#submit'], 'comment_search_form_search_admin_settings_submit');
 }
 
 /**
  * Additional submit handler for search_admin_settings.
  *
- * Saves the exclude_from_node setting to comment_search.settings and
- * removes the value from $form_state so core does not also save it into
- * search.settings. Triggers a node re-index if the setting changed.
+ * Saves settings to comment_search.settings and removes values from
+ * $form_state so core does not write them into search.settings.
  */
 function comment_search_form_search_admin_settings_submit($form, &$form_state) {
   $config = config('comment_search.settings');
@@ -54,11 +110,13 @@ function comment_search_form_search_admin_settings_submit($form, &$form_state) {
   $new = (bool) $form_state['values']['comment_search_exclude_from_node'];
 
   $config->set('exclude_from_node', $new);
+  $config->set('comment_rank_recency', (int) $form_state['values']['comment_rank_recency']);
+  $config->set('comment_rank_relevance', (int) $form_state['values']['comment_rank_relevance']);
   $config->save();
 
-  // Remove our value so core's submit handler does not write it to
-  // search.settings.
   unset($form_state['values']['comment_search_exclude_from_node']);
+  unset($form_state['values']['comment_rank_recency']);
+  unset($form_state['values']['comment_rank_relevance']);
 
   if ($previous !== $new) {
     db_update('search_dataset')
@@ -104,16 +162,12 @@ function comment_search_search_access() {
 }
 
 /**
- * Conditions callback for hook_search_info().
  * Implements hook_form_FORM_ID_alter() for search_form.
  *
  * Injects an advanced search fieldset into the search form when the user is
  * on the Comments search tab and has the 'use advanced search' permission.
- * Keyword refinements are submitted as GET parameters and folded into the
- * search keys string in hook_search_execute().
  */
 function comment_search_form_search_form_alter(&$form, &$form_state) {
-  // Only alter the form on the comment search tab.
   if (arg(1) !== 'comment') {
     return;
   }
@@ -165,7 +219,6 @@ function comment_search_form_search_form_alter(&$form, &$form_state) {
     '#suffix' => '</div>',
   );
 
-  // Add a submit handler to fold advanced keywords into the GET redirect.
   $form['#submit'][] = 'comment_search_form_search_form_submit';
 }
 
@@ -302,14 +355,8 @@ function comment_search_update_index() {
 /**
  * Implements hook_search_execute().
  *
- * Fetches all matching comments in one pass, deduplicates by cid, then
- * paginates manually using pager_default_initialize(). This approach is
- * used because SearchQuery's internal query rewriting makes a separate
- * count query unreliable.
- *
- * Advanced search keyword refinements (phrase, OR, negative) are folded
- * into the keys string in the same format core node search uses, so
- * SearchQuery's built-in parsing handles them automatically.
+ * Fetches all matching comments in one pass, deduplicates by cid, applies
+ * configurable ranking factors, then paginates.
  *
  * @param string|null $keys
  *   The search keywords entered by the user.
@@ -321,8 +368,7 @@ function comment_search_update_index() {
  *   date, extra, snippet, and optionally user.
  */
 function comment_search_search_execute($keys = NULL, $conditions = NULL) {
-  // Fold advanced search keyword refinements into the keys string,
-  // matching the format core node search uses so SearchQuery parses them.
+  // Fold advanced search keyword refinements into the keys string.
   if (user_access('use advanced search')) {
     if (!empty($_GET['phrase'])) {
       $keys .= ' "' . str_replace('"', ' ', $_GET['phrase']) . '"';
@@ -361,7 +407,7 @@ function comment_search_search_execute($keys = NULL, $conditions = NULL) {
     return array();
   }
 
-  // Remove duplicates by cid since search_index has 1 row per word per comment.
+  // Dedupe by cid since search_index has one row per word per comment.
   $seen = array();
   $unique_rows = array();
   foreach ($all_rows as $row) {
@@ -371,13 +417,42 @@ function comment_search_search_execute($keys = NULL, $conditions = NULL) {
     }
   }
 
+  // Apply configurable ranking factors.
+  $config = config('comment_search.settings');
+  $recency_weight = (int) ($config->get('comment_rank_recency') ?: 0);
+  $relevance_weight = (int) ($config->get('comment_rank_relevance') ?: 0);
+
+  if ($recency_weight > 0 || $relevance_weight > 0) {
+    // Normalise scores to 0-1 range for fair weighting across factors.
+    $scores = array_map(function($r) { return $r->score; }, $unique_rows);
+    $max_score = max($scores) ?: 1;
+    $times = array_map(function($r) { return $r->changed; }, $unique_rows);
+    $oldest = min($times);
+    $newest = max($times);
+    $time_range = ($newest - $oldest) ?: 1;
+
+    foreach ($unique_rows as &$row) {
+      $keyword_score = ($row->score / $max_score) * ($relevance_weight ?: 1);
+      $recency_score = $recency_weight > 0
+        ? (($row->changed - $oldest) / $time_range) * $recency_weight
+        : 0;
+      $row->score = $keyword_score + $recency_score;
+    }
+    unset($row);
+
+    // Re-sort by combined score descending.
+    usort($unique_rows, function($a, $b) {
+      return $b->score <=> $a->score;
+    });
+  }
+
   $total_count = count($unique_rows);
 
   // Core search does not expose a results-per-page config key; use 10
   // to match core's hardcoded default in search_view().
   $per_page = 10;
 
-  // Initialise the pager — core renders it automatically.
+  // Initialise the pager - core renders it automatically.
   $current_page = pager_default_initialize($total_count, $per_page);
   $offset = $current_page * $per_page;
   $page_rows = array_slice($unique_rows, $offset, $per_page);
